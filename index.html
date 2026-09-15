@@ -299,7 +299,7 @@
   }
 
   function detectPaper(src){
-    var LONG = 340;
+    var LONG = 360;
     var s = Math.min(1, LONG / Math.max(src.width, src.height));
     var w = Math.max(24, Math.round(src.width*s));
     var h = Math.max(24, Math.round(src.height*s));
@@ -308,38 +308,44 @@
     var ctx = c.getContext("2d");
     ctx.drawImage(src, 0, 0, w, h);
     var d = ctx.getImageData(0,0,w,h).data;
+    var n = w*h;
 
-    var n = w*h, gray = new Uint8Array(n), hist = new Uint32Array(256);
-    for (var i=0, p=0; p<n; i+=4, p++){
-      var g = (0.299*d[i] + 0.587*d[i+1] + 0.114*d[i+2]) | 0;
-      gray[p] = g; hist[g]++;
+    // 1. 写真のふち（外周の帯）から背景色を推定する
+    //    紙は普通ふちまで届かないので、ふち＝机などの背景とみなせる
+    var band = Math.max(2, Math.round(Math.min(w,h) * 0.06));
+    var rs=[], gs=[], bs=[];
+    function sample(x,y){
+      var i=(y*w+x)*4; rs.push(d[i]); gs.push(d[i+1]); bs.push(d[i+2]);
     }
+    for (var x=0;x<w;x++){ for (var b=0;b<band;b++){ sample(x,b); sample(x,h-1-b); } }
+    for (var y=0;y<h;y++){ for (var b2=0;b2<band;b2++){ sample(b2,y); sample(w-1-b2,y); } }
+    function median(a){ a.sort(function(p,q){return p-q;}); return a[a.length>>1]; }
+    var br = median(rs), bg = median(gs), bb = median(bs);
 
-    // 大津の二値化で「紙」と「背景」を分ける
-    var sum = 0, t;
-    for (t=0;t<256;t++) sum += t*hist[t];
-    var sumB = 0, wB = 0, best = -1, thr = 128;
-    for (t=0;t<256;t++){
-      wB += hist[t]; if (!wB) continue;
-      var wF = n - wB; if (!wF) break;
-      sumB += t*hist[t];
-      var mB = sumB/wB, mF = (sum-sumB)/wF;
-      var v = wB*wF*(mB-mF)*(mB-mF);
-      if (v > best){ best = v; thr = t; }
+    // 背景色のばらつき（ふちが散らかっている＝背景が一様でない指標）
+    var spread = 0, cnt = rs.length;
+    for (var m=0;m<cnt;m++){
+      spread += Math.abs(rs[m]-br) + Math.abs(gs[m]-bg) + Math.abs(bs[m]-bb);
     }
+    spread /= cnt;                                  // 0に近いほど一様
+    var thr = Math.max(34, spread * 1.6 + 26);      // 背景からどれだけ離れたら「紙」とみなすか
 
+    // 2. 背景色と十分違う画素を「紙」とする
     var mask = new Uint8Array(n);
-    for (var q=0;q<n;q++) mask[q] = gray[q] > thr ? 1 : 0;
-    mask = dilate(mask, w, h);          // 文字による穴を埋める
+    for (var p=0, i2=0; p<n; p++, i2+=4){
+      var diff = Math.abs(d[i2]-br) + Math.abs(d[i2+1]-bg) + Math.abs(d[i2+2]-bb);
+      mask[p] = diff > thr ? 1 : 0;
+    }
+    mask = dilate(mask, w, h);                       // 文字や隙間で分断されないよう埋める
     mask = dilate(mask, w, h);
 
-    // 最大の明るい連結領域を探す
+    // 3. 最大の連結領域＝紙 の外接矩形を得る
     var seen = new Uint8Array(n), stack = new Int32Array(n);
     var bx0=0, by0=0, bx1=0, by1=0, bestArea = 0;
     for (var start=0; start<n; start++){
       if (!mask[start] || seen[start]) continue;
-      var top = 0; stack[top++] = start; seen[start] = 1;
-      var area = 0, x0=w, y0=h, x1=-1, y1=-1;
+      var top=0; stack[top++]=start; seen[start]=1;
+      var area=0, x0=w, y0=h, x1=-1, y1=-1;
       while (top){
         var cur = stack[--top];
         var cx = cur % w, cy = (cur / w) | 0;
@@ -351,25 +357,29 @@
         if (cy>0   && mask[cur-w] && !seen[cur-w]){ seen[cur-w]=1; stack[top++]=cur-w; }
         if (cy<h-1 && mask[cur+w] && !seen[cur+w]){ seen[cur+w]=1; stack[top++]=cur+w; }
       }
-      if (area > bestArea){ bestArea = area; bx0=x0; by0=y0; bx1=x1; by1=y1; }
+      if (area > bestArea){ bestArea=area; bx0=x0; by0=y0; bx1=x1; by1=y1; }
     }
     if (bestArea === 0) return null;
 
-    // 膨張ぶんを戻す
-    bx0 += 2; by0 += 2; bx1 -= 2; by1 -= 2;
     var bw = bx1 - bx0 + 1, bh = by1 - by0 + 1;
-    if (bw < w*0.25 || bh < h*0.25) return null;            // 小さすぎる＝誤検出
+    // 4. 判定（甘め）: 明らかな誤検出だけ弾き、迷ったら切り抜く
+    if (bw < w*0.15 || bh < h*0.15) return null;        // 小さすぎ＝ゴミ
     var cover = (bw*bh) / (w*h);
-    if (cover > 0.94) return null;                           // ほぼ全面＝切る必要なし
-    if (bestArea / (bw*bh) < 0.55) return null;              // 矩形らしくない
+    if (cover > 0.97) return null;                       // ほぼ全面＝切る必要なし
+    if (bestArea / (bw*bh) < 0.45) return null;          // 矩形からかけ離れている
+
+    // ふちを少しだけ広げて紙のギリギリを欠かないようにする
+    var pad = Math.round(Math.min(w,h) * 0.01);
+    bx0 = Math.max(0, bx0 - pad); by0 = Math.max(0, by0 - pad);
+    bx1 = Math.min(w-1, bx1 + pad); by1 = Math.min(h-1, by1 + pad);
 
     var k = 1/s;
-    var x = Math.max(0, Math.round(bx0*k));
-    var y = Math.max(0, Math.round(by0*k));
+    var rx = Math.max(0, Math.round(bx0*k));
+    var ry = Math.max(0, Math.round(by0*k));
     return {
-      x: x, y: y,
-      w: Math.min(src.width - x, Math.round(bw*k)),
-      h: Math.min(src.height - y, Math.round(bh*k))
+      x: rx, y: ry,
+      w: Math.min(src.width - rx, Math.round((bx1-bx0+1)*k)),
+      h: Math.min(src.height - ry, Math.round((by1-by0+1)*k))
     };
   }
 
